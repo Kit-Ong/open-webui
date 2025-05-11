@@ -278,7 +278,15 @@ def query_collection(
             return None, e
 
     # Generate all query embeddings (in one call)
-    query_embeddings = embedding_function(queries, prefix=RAG_EMBEDDING_QUERY_PREFIX)
+    try:
+        if embedding_function is None:
+            log.error("embedding_function is None in query_collection")
+            raise ValueError("Embedding function is not initialized")
+            
+        query_embeddings = embedding_function(queries, prefix=RAG_EMBEDDING_QUERY_PREFIX)
+    except Exception as e:
+        log.error(f"Error generating embeddings: {e}")
+        raise ValueError(f"Failed to generate query embeddings: {str(e)}")
     log.debug(
         f"query_collection: processing {len(queries)} queries across {len(collection_names)} collections"
     )
@@ -388,9 +396,30 @@ def get_embedding_function(
     embedding_batch_size,
 ):
     if embedding_engine == "":
-        return lambda query, prefix=None, user=None: embedding_function.encode(
-            query, **({"prompt": prefix} if prefix else {})
-        ).tolist()
+        if embedding_function is None:
+            log.error(f"embedding_function is None for embedding_engine='' and model={embedding_model}")
+            # Try to load the fallback model instead of raising an error
+            try:
+                from open_webui.retrieval.fallback_embeddings import get_fallback_embedding_model
+                fallback_model = get_fallback_embedding_model()
+                log.info(f"Using fallback embedding model for {embedding_model}")
+                return lambda query, prefix=None, user=None: fallback_model.encode(
+                    query, **({"prompt": prefix} if prefix else {})
+                )
+            except Exception as e:
+                log.error(f"Failed to initialize fallback embedding model: {e}")
+                raise ValueError(f"No embedding function available for model {embedding_model}")
+        
+        # Check if we need to post-process the vector to a list
+        if hasattr(embedding_function.encode("test"), 'tolist'):
+            return lambda query, prefix=None, user=None: embedding_function.encode(
+                query, **({"prompt": prefix} if prefix else {})
+            ).tolist()
+        else:
+            # Already returns a list
+            return lambda query, prefix=None, user=None: embedding_function.encode(
+                query, **({"prompt": prefix} if prefix else {})
+            )
     elif embedding_engine in ["ollama", "openai"]:
         func = lambda query, prefix=None, user=None: generate_embeddings(
             engine=embedding_engine,

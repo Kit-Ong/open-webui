@@ -119,19 +119,58 @@ def get_ef(
     auto_update: bool = False,
 ):
     ef = None
-    if embedding_model and engine == "":
-        from sentence_transformers import SentenceTransformer
-
-        try:
-            ef = SentenceTransformer(
-                get_model_path(embedding_model, auto_update),
-                device=DEVICE_TYPE,
-                trust_remote_code=RAG_EMBEDDING_MODEL_TRUST_REMOTE_CODE,
-                backend=SENTENCE_TRANSFORMERS_BACKEND,
-                model_kwargs=SENTENCE_TRANSFORMERS_MODEL_KWARGS,
-            )
-        except Exception as e:
-            log.debug(f"Error loading SentenceTransformer: {e}")
+    if embedding_model:
+        if engine == "":
+            # Local sentence_transformers model
+            try:
+                # Use our patched import mechanism
+                from open_webui.retrieval.st_patch import safe_import_sentence_transformers
+                SentenceTransformer = safe_import_sentence_transformers()
+                
+                if SentenceTransformer:
+                    try:
+                        ef = SentenceTransformer(
+                            get_model_path(embedding_model, auto_update),
+                            device=DEVICE_TYPE,
+                            trust_remote_code=RAG_EMBEDDING_MODEL_TRUST_REMOTE_CODE,
+                            backend=SENTENCE_TRANSFORMERS_BACKEND,
+                            model_kwargs=SENTENCE_TRANSFORMERS_MODEL_KWARGS,
+                        )
+                        log.info(f"Successfully loaded SentenceTransformer model: {embedding_model}")
+                    except Exception as e:
+                        log.warning(f"Error loading SentenceTransformer: {e}")
+                        log.warning(f"Falling back to alternate embedding implementation")
+                        ef = None
+                else:
+                    log.warning("SentenceTransformer could not be imported, using fallback")
+                    ef = None
+            except ImportError:
+                log.warning("SentenceTransformer package not available, falling back to alternative implementation")
+                ef = None
+                
+            # If SentenceTransformer failed, use our fallback implementation
+            if ef is None:
+                try:
+                    from open_webui.retrieval.fallback_embeddings import get_fallback_embedding_model
+                    ef = get_fallback_embedding_model()
+                    log.info(f"Using fallback embedding model for {embedding_model}")
+                except Exception as e:
+                    log.error(f"Error initializing fallback embedding model: {e}")
+            
+        elif engine in ["openai", "ollama"]:
+            # For openai and ollama we'll create a placeholder object with encode method
+            class EmbeddingFunction:
+                def __init__(self, engine, model):
+                    self.engine = engine
+                    self.model = model
+                
+                def encode(self, text, **kwargs):
+                    # This is a placeholder. The actual embedding is handled by
+                    # the get_embedding_function returned lambda
+                    return []
+            
+            ef = EmbeddingFunction(engine, embedding_model)
+            log.debug(f"Created placeholder embedding function for {engine} with model {embedding_model}")
 
     return ef
 
@@ -1001,28 +1040,54 @@ def save_docs_to_vector_db(
                 return True
 
         log.info(f"adding to collection {collection_name}")
-        embedding_function = get_embedding_function(
-            request.app.state.config.RAG_EMBEDDING_ENGINE,
-            request.app.state.config.RAG_EMBEDDING_MODEL,
-            request.app.state.ef,
-            (
-                request.app.state.config.RAG_OPENAI_API_BASE_URL
-                if request.app.state.config.RAG_EMBEDDING_ENGINE == "openai"
-                else request.app.state.config.RAG_OLLAMA_BASE_URL
-            ),
-            (
-                request.app.state.config.RAG_OPENAI_API_KEY
-                if request.app.state.config.RAG_EMBEDDING_ENGINE == "openai"
-                else request.app.state.config.RAG_OLLAMA_API_KEY
-            ),
-            request.app.state.config.RAG_EMBEDDING_BATCH_SIZE,
-        )
+        
+        # Import the utility function to ensure embedding function is initialized
+        from open_webui.retrieval.initialize import ensure_embedding_function
+        
+        # Ensure embedding function is initialized
+        ensure_embedding_function(request)
+        
+        try:
+            # Use the app state embedding function directly if available
+            if request.app.state.EMBEDDING_FUNCTION:
+                embedding_function = request.app.state.EMBEDDING_FUNCTION
+            else:
+                # Fallback to creating a new one if needed
+                embedding_function = get_embedding_function(
+                    request.app.state.config.RAG_EMBEDDING_ENGINE,
+                    request.app.state.config.RAG_EMBEDDING_MODEL,
+                    request.app.state.ef,
+                    (
+                        request.app.state.config.RAG_OPENAI_API_BASE_URL
+                        if request.app.state.config.RAG_EMBEDDING_ENGINE == "openai"
+                        else request.app.state.config.RAG_OLLAMA_BASE_URL
+                    ),
+                    (
+                        request.app.state.config.RAG_OPENAI_API_KEY
+                        if request.app.state.config.RAG_EMBEDDING_ENGINE == "openai"
+                        else request.app.state.config.RAG_OLLAMA_API_KEY
+                    ),
+                    request.app.state.config.RAG_EMBEDDING_BATCH_SIZE,
+                )
 
-        embeddings = embedding_function(
-            list(map(lambda x: x.replace("\n", " "), texts)),
-            prefix=RAG_EMBEDDING_CONTENT_PREFIX,
-            user=user,
-        )
+            if not embedding_function:
+                log.error("Embedding function is None after initialization attempts")
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Failed to initialize embedding function. Check your RAG configuration."
+                )
+
+            embeddings = embedding_function(
+                list(map(lambda x: x.replace("\n", " "), texts)),
+                prefix=RAG_EMBEDDING_CONTENT_PREFIX,
+                user=user,
+            )
+        except Exception as e:
+            log.error(f"Error generating embeddings: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to generate embeddings. Ensure the embedding function is correctly configured."
+            )
 
         items = [
             {
@@ -1181,6 +1246,14 @@ def process_file(
 
         if not request.app.state.config.BYPASS_EMBEDDING_AND_RETRIEVAL:
             try:
+                log.info(f"Processing file: {file.filename} for collection: {collection_name}")
+                
+                # Import and use the utility function to ensure embedding function is initialized
+                from open_webui.retrieval.initialize import ensure_embedding_function
+                
+                # Ensure embedding function is properly initialized before processing
+                ensure_embedding_function(request)
+                
                 result = save_docs_to_vector_db(
                     request,
                     docs=docs,
@@ -1208,8 +1281,15 @@ def process_file(
                         "filename": file.filename,
                         "content": text_content,
                     }
-            except Exception as e:
+            except HTTPException as e:
+                log.error(f"HTTP exception in process_file: {str(e)}")
                 raise e
+            except Exception as e:
+                log.error(f"Exception in process_file: {str(e)}")
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"Error processing file: {str(e)}"
+                )
         else:
             return {
                 "status": True,

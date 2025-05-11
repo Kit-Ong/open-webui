@@ -737,40 +737,113 @@ app.state.YOUTUBE_LOADER_TRANSLATION = None
 
 
 try:
+    log.info(f"Initializing embedding function with engine: {app.state.config.RAG_EMBEDDING_ENGINE}, model: {app.state.config.RAG_EMBEDDING_MODEL}")
+    
+    # Initialize embedding function
     app.state.ef = get_ef(
         app.state.config.RAG_EMBEDDING_ENGINE,
         app.state.config.RAG_EMBEDDING_MODEL,
         RAG_EMBEDDING_MODEL_AUTO_UPDATE,
     )
+    
+    if app.state.ef is None:
+        log.warning(f"get_ef returned None for engine: {app.state.config.RAG_EMBEDDING_ENGINE}, model: {app.state.config.RAG_EMBEDDING_MODEL}")
+        # As a last resort, try to load our fallback embeddings
+        try:
+            from open_webui.retrieval.fallback_embeddings import get_fallback_embedding_model
+            app.state.ef = get_fallback_embedding_model()
+            log.info("Successfully initialized fallback embedding model")
+        except Exception as fallback_error:
+            log.error(f"Failed to initialize fallback embedding model: {fallback_error}")
 
-    app.state.rf = get_rf(
-        app.state.config.RAG_RERANKING_ENGINE,
-        app.state.config.RAG_RERANKING_MODEL,
-        app.state.config.RAG_EXTERNAL_RERANKER_URL,
-        app.state.config.RAG_EXTERNAL_RERANKER_API_KEY,
-        RAG_RERANKING_MODEL_AUTO_UPDATE,
-    )
+    # Initialize reranking function
+    try:
+        app.state.rf = get_rf(
+            app.state.config.RAG_RERANKING_ENGINE,
+            app.state.config.RAG_RERANKING_MODEL,
+            app.state.config.RAG_EXTERNAL_RERANKER_URL,
+            app.state.config.RAG_EXTERNAL_RERANKER_API_KEY,
+            RAG_RERANKING_MODEL_AUTO_UPDATE,
+        )
+    except Exception as reranking_error:
+        log.error(f"Error initializing reranking model: {reranking_error}")
+        app.state.rf = None
 except Exception as e:
-    log.error(f"Error updating models: {e}")
-    pass
+    log.error(f"Error initializing embedding/reranking models: {e}")
+    # Don't use pass here, we need to handle the error
+    if app.state.config.RAG_EMBEDDING_ENGINE in ["openai", "ollama"]:
+        log.info(f"Creating placeholder embedding function for {app.state.config.RAG_EMBEDDING_ENGINE}")
+        # Create a placeholder object that will work with external embeddings
+        class EmbeddingFunction:
+            def __init__(self, engine, model):
+                self.engine = engine
+                self.model = model
+            
+            def encode(self, text, **kwargs):
+                # This is a placeholder. The actual embedding is handled by the get_embedding_function
+                return []
+        
+        app.state.ef = EmbeddingFunction(app.state.config.RAG_EMBEDDING_ENGINE, app.state.config.RAG_EMBEDDING_MODEL)
+    else:
+        # For local embedding model, try our fallback implementation
+        try:
+            from open_webui.retrieval.fallback_embeddings import get_fallback_embedding_model
+            app.state.ef = get_fallback_embedding_model()
+            log.info("Using fallback embedding model after initialization error")
+        except Exception as fallback_error:
+            log.error(f"Failed to initialize fallback embedding model: {fallback_error}")
 
-
-app.state.EMBEDDING_FUNCTION = get_embedding_function(
-    app.state.config.RAG_EMBEDDING_ENGINE,
-    app.state.config.RAG_EMBEDDING_MODEL,
-    app.state.ef,
-    (
-        app.state.config.RAG_OPENAI_API_BASE_URL
-        if app.state.config.RAG_EMBEDDING_ENGINE == "openai"
-        else app.state.config.RAG_OLLAMA_BASE_URL
-    ),
-    (
-        app.state.config.RAG_OPENAI_API_KEY
-        if app.state.config.RAG_EMBEDDING_ENGINE == "openai"
-        else app.state.config.RAG_OLLAMA_API_KEY
-    ),
-    app.state.config.RAG_EMBEDDING_BATCH_SIZE,
-)
+try:
+    app.state.EMBEDDING_FUNCTION = get_embedding_function(
+        app.state.config.RAG_EMBEDDING_ENGINE,
+        app.state.config.RAG_EMBEDDING_MODEL,
+        app.state.ef,
+        (
+            app.state.config.RAG_OPENAI_API_BASE_URL
+            if app.state.config.RAG_EMBEDDING_ENGINE == "openai"
+            else app.state.config.RAG_OLLAMA_BASE_URL
+        ),
+        (
+            app.state.config.RAG_OPENAI_API_KEY
+            if app.state.config.RAG_EMBEDDING_ENGINE == "openai"
+            else app.state.config.RAG_OLLAMA_API_KEY
+        ),
+        app.state.config.RAG_EMBEDDING_BATCH_SIZE,
+    )
+    
+    if app.state.EMBEDDING_FUNCTION is None:
+        log.error("Failed to initialize app.state.EMBEDDING_FUNCTION")
+        # Instead of raising an error, create a direct wrapper around the fallback function
+        # This ensures we always have an embedding function
+        if app.state.ef is not None and hasattr(app.state.ef, 'encode'):
+            log.info("Creating direct wrapper for embedding function from app.state.ef")
+            app.state.EMBEDDING_FUNCTION = lambda query, prefix=None, user=None: app.state.ef.encode(
+                query, **({"prompt": prefix} if prefix else {})
+            )
+        else:
+            # Last resort - create a minimal working embedding function
+            log.warning("Creating extremely basic fallback embedding function")
+            from open_webui.retrieval.fallback_embeddings import get_fallback_embedding_model
+            fallback_model = get_fallback_embedding_model()
+            app.state.EMBEDDING_FUNCTION = lambda query, prefix=None, user=None: fallback_model.encode(
+                query, **({"prompt": prefix} if prefix else {})
+            )
+        
+    log.info(f"Successfully initialized embedding function for engine: {app.state.config.RAG_EMBEDDING_ENGINE}")
+except Exception as e:
+    log.error(f"Error initializing embedding function: {e}")
+    # Create a working fallback instead of raising an error
+    log.warning("Creating fallback embedding function after initialization error")
+    try:
+        from open_webui.retrieval.fallback_embeddings import get_fallback_embedding_model
+        fallback_model = get_fallback_embedding_model()
+        app.state.EMBEDDING_FUNCTION = lambda query, prefix=None, user=None: fallback_model.encode(
+            query, **({"prompt": prefix} if prefix else {})
+        )
+        log.info("Successfully initialized fallback embedding function")
+    except Exception as fallback_error:
+        log.error(f"Fatal error: Could not initialize any embedding function: {fallback_error}")
+        raise ValueError(f"Failed to initialize embedding function: {e}")
 
 ########################################
 #
